@@ -129,8 +129,7 @@ def gpt_make_novel(
     Claude 대신 OpenAI GPT로 소설 생성.
     OpenAI Python SDK + Responses API 패턴 사용. :contentReference[oaicite:2]{index=2}
     """
-    #api_key = os.getenv("OPENAI_API_KEY")
-    api_key = "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"
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY 환경변수가 필요합니다.")
 
@@ -178,7 +177,7 @@ def gpt_make_novel(
 def make_genai_client_dev():
     # ✅ 절대 코드에 API 키를 하드코딩하지 마세요.
     # 환경변수 GOOGLE_API_KEY로 넣어야 안전합니다.
-    api_key = "AIzaSyAjIHVyGxdJ_ek3icPrd47RnwaX7kNow0U"
+    api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError("GOOGLE_API_KEY 환경변수가 필요합니다 (Gemini Developer API).")
     return genai.Client(api_key=api_key)
