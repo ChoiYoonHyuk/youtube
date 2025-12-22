@@ -24,6 +24,10 @@ from google.genai import types
 from PIL import Image
 from io import BytesIO
 
+# NEW: news article extraction
+import requests
+from bs4 import BeautifulSoup
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -100,6 +104,87 @@ def run_ffmpeg(args: List[str]) -> None:
 
 
 # =========================
+# NEW: News URL -> Article text
+# =========================
+
+def is_url(s: str) -> bool:
+    return bool(re.match(r"^https?://", (s or "").strip(), re.I))
+
+def fetch_html(url: str, timeout: int = 15) -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
+    }
+    r = requests.get(url, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r.text
+
+def extract_naver_news(html: str) -> tuple[str, str]:
+    """
+    Naver 뉴스(모바일/PC 공통)에서 제목/본문 추출.
+    - 본문: div#dic_area 우선
+    - 제목: og:title 또는 <title>
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # title
+    title = ""
+    og = soup.select_one("meta[property='og:title']")
+    if og and og.get("content"):
+        title = og["content"].strip()
+    if not title and soup.title and soup.title.string:
+        title = soup.title.string.strip()
+
+    # body
+    body = ""
+    dic = soup.select_one("#dic_area")
+    if dic:
+        body = dic.get_text("\n", strip=True)
+
+    # 폴백 후보
+    if not body:
+        for sel in ["#articeBody", "#articleBodyContents", ".newsct_article", ".article_body", "article"]:
+            el = soup.select_one(sel)
+            if el:
+                txt = el.get_text("\n", strip=True)
+                if len(txt) > len(body):
+                    body = txt
+
+    body = re.sub(r"\s+\n", "\n", body).strip()
+    return title, body
+
+def extract_article_with_readability(html: str) -> tuple[str, str]:
+    """
+    DOM이 바뀌거나 일부 영역이 비어있을 때 폴백.
+    """
+    try:
+        from readability import Document
+    except Exception:
+        return "", ""
+
+    doc = Document(html)
+    title = (doc.short_title() or "").strip()
+    cleaned_html = doc.summary(html_partial=True)
+    soup = BeautifulSoup(cleaned_html, "html.parser")
+    body = soup.get_text("\n", strip=True)
+    body = re.sub(r"\s+\n", "\n", body).strip()
+    return title, body
+
+def fetch_article_text(url: str) -> tuple[str, str]:
+    html = fetch_html(url)
+    title, body = extract_naver_news(html)
+
+    if len(body) < 400:
+        t2, b2 = extract_article_with_readability(html)
+        if len(b2) > len(body):
+            title = title or t2
+            body = b2
+
+    if not body:
+        raise RuntimeError("기사 본문을 추출하지 못했습니다. (DOM 변경/접근 제한 가능)")
+    return title or "뉴스", body
+
+
+# =========================
 # Step 0: Google News RSS (optional)
 # =========================
 
@@ -127,7 +212,7 @@ def gpt_make_novel(
 ) -> Dict[str, str]:
     """
     Claude 대신 OpenAI GPT로 소설 생성.
-    OpenAI Python SDK + Responses API 패턴 사용. :contentReference[oaicite:2]{index=2}
+    OpenAI Python SDK + Responses API 패턴 사용.
     """
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -155,7 +240,6 @@ def gpt_make_novel(
 }}
 """.strip()
 
-    # Responses API: output_text로 텍스트 얻는 방식이 권장 흐름 :contentReference[oaicite:3]{index=3}
     resp = client.responses.create(
         model=model,
         input=prompt,
@@ -166,12 +250,11 @@ def gpt_make_novel(
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        # JSON이 깨졌을 때도 파이프라인이 죽지 않도록 최소 복구
         return {"title": "untitled", "logline": "", "novel": raw}
 
 
 # =========================
-# Step 2: Novel -> Script (Gemini Developer API)
+# Step 2: Script generation (Gemini Developer API)
 # =========================
 
 def make_genai_client_dev():
@@ -193,7 +276,6 @@ def _extract_json_object(text: str) -> str:
     m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, flags=re.IGNORECASE)
     if m:
         candidate = m.group(1).strip()
-        # candidate가 JSON 객체/배열일 가능성이 높음
         text = candidate
 
     # 2) 가장 첫 '{'부터 마지막 '}'까지 잘라보기
@@ -204,21 +286,18 @@ def _extract_json_object(text: str) -> str:
 
     return text.strip()
 
-
 def _gemini_force_json_only(*, client, model: str, sys: str, user: str, max_output_tokens: int) -> str:
-    # Pydantic 스키마를 dict(JSON schema)로 뽑아서 넣어도 되고,
-    # google-genai의 types.Schema를 직접 구성해도 됩니다.
     schema = ScriptPack.model_json_schema()
 
     resp = client.models.generate_content(
         model=model,
         contents=[types.Content(role="user", parts=[types.Part(text=user)])],
         config=types.GenerateContentConfig(
-            system_instruction=sys,                      # ✅ system을 진짜 system으로
+            system_instruction=sys,
             max_output_tokens=max_output_tokens,
             temperature=0.4,
-            response_mime_type="application/json",       # ✅ JSON 모드
-            response_schema=schema,                      # ✅ 스키마 강제
+            response_mime_type="application/json",
+            response_schema=schema,
         ),
     )
     return resp.text or ""
@@ -229,13 +308,11 @@ def extract_first_json_value(s: str) -> str | None:
     # 코드블록 제거
     if s.startswith("```"):
         s = s.strip("`").strip()
-        # ```json\n ... \n``` 형태도 대충 제거
         if "\n" in s:
             first_line, rest = s.split("\n", 1)
             if first_line.lower().startswith("json"):
                 s = rest.strip()
 
-    # 시작 위치 찾기
     start = None
     for i, ch in enumerate(s):
         if ch in "{[":
@@ -261,12 +338,10 @@ def extract_first_json_value(s: str) -> str | None:
                 in_str = False
             continue
 
-        # 문자열 시작
         if ch == '"':
             in_str = True
             continue
 
-        # 구조 문자 처리
         if ch in "{[":
             stack.append(ch)
         elif ch in "}]":
@@ -282,18 +357,13 @@ def extract_first_json_value(s: str) -> str | None:
 
 def try_load_json_loose(raw: str) -> dict:
     s = raw.strip()
-
-    # 이상 따옴표 정리
     s = s.replace("“", '"').replace("”", '"').replace("’", "'")
 
-    # JSON 덩어리만 정확히 추출
     candidate = extract_first_json_value(s)
     if candidate is None:
         raise json.JSONDecodeError("No JSON object/array found", s, 0)
 
-    # 트레일링 콤마 제거
     candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
-
     return json.loads(candidate)
 
 def gemini_scriptify(
@@ -345,13 +415,10 @@ def gemini_scriptify(
 - JSON만 출력. 절대 다른 문장/설명/백틱 금지.
 """.strip()
 
-    # 1) 1차 시도
     raw = _gemini_force_json_only(
         client=client, model=model, sys=sys, user=user, max_output_tokens=max_output_tokens
     )
-    j = _extract_json_object(raw)
 
-    # 2) 파싱 실패 시 1회 재시도(더 강하게)
     for attempt in range(2):
         try:
             data = try_load_json_loose(raw)
@@ -364,10 +431,101 @@ def gemini_scriptify(
             raw = _gemini_force_json_only(
                 client=client, model=model, sys=sys, user=repair_user, max_output_tokens=max_output_tokens
             )
-            j = _extract_json_object(raw)
 
-    # 여기에 도달하진 않음
     raise RuntimeError("Unexpected JSON parse failure.")
+
+# NEW: News -> ScriptPack (Gemini, JSON schema enforced)
+def gemini_news_scriptify(
+    *,
+    article_title: str,
+    article_body: str,
+    client,
+    model: str = "gemini-2.5-flash",
+    max_scenes: int = 7,
+    max_output_tokens: int = 4096,
+) -> ScriptPack:
+    sys = """
+너는 유튜브 쇼츠(9:16)용 '뉴스 요약 이미지 기반 영상' 제작자야.
+입력된 한국어 뉴스 기사(제목/본문)를 바탕으로:
+- 30~45초 분량
+- 장면은 최대 N개
+- 사실 기반, 과장 금지, 기사에 없는 단정 금지
+- 각 장면에 (title, visual, narration, image_prompt, sfx_tags, duration_sec_hint)을 채워 ScriptPack 스키마로 JSON만 출력한다.
+
+중요:
+- 반드시 JSON만 출력(추가 텍스트 금지).
+- 첫 장면에서 전체 톤(스타일/색감/카메라)을 정의하고, 이후 장면 image_prompt에 반복해 일관성 유지.
+""".strip()
+
+    body_trim = article_body[:6000]
+
+    user = f"""
+[뉴스 제목]
+{article_title}
+
+[뉴스 본문]
+{body_trim}
+
+[요구사항]
+- 장면 수는 최대 {max_scenes}개
+- narration은 한국어(짧고 리듬감 있게)
+- visual은 화면에 보이는 장면 설명(한국어)
+- image_prompt는 세로 9:16, 시네마틱, 한국 뉴스/다큐 톤, 텍스트 삽입 금지
+- duration_sec_hint는 3~7초 범위 권장
+
+[출력 JSON 스키마]
+{{
+  "video_title": "쇼츠 제목(한국어, 60자 이내)",
+  "video_description": "유튜브 설명(한국어, 2~4줄)",
+  "tags": ["...", "..."],
+  "scenes": [
+    {{
+      "idx": 1,
+      "title": "...",
+      "visual": "...",
+      "narration": "...",
+      "dialogue": null,
+      "image_prompt": "...",
+      "sfx_tags": ["...","..."],
+      "duration_sec_hint": 5.0
+    }}
+  ]
+}}
+
+[출력 규칙]
+- JSON만 출력. 절대 다른 문장/설명/백틱 금지.
+""".strip()
+
+    raw = _gemini_force_json_only(
+        client=client,
+        model=model,
+        sys=sys,
+        user=user,
+        max_output_tokens=max_output_tokens,
+    )
+
+    for attempt in range(2):
+        try:
+            data = try_load_json_loose(raw)
+            # 스키마 검증으로 일관성 확보
+            pack = ScriptPack.model_validate(data)
+            # 장면 수 상한 방어
+            if len(pack.scenes) > max_scenes:
+                pack.scenes = pack.scenes[:max_scenes]
+            return pack
+        except Exception:
+            if attempt == 1:
+                raise RuntimeError(f"Gemini(뉴스)가 JSON을 깨뜨렸습니다. 원문:\n---\n{raw}\n---")
+            repair_user = user + "\n\n너의 이전 출력은 JSON 파싱이 실패했다. JSON 객체만 다시 출력하라."
+            raw = _gemini_force_json_only(
+                client=client,
+                model=model,
+                sys=sys,
+                user=repair_user,
+                max_output_tokens=max_output_tokens,
+            )
+
+    raise RuntimeError("Unexpected JSON parse failure (news).")
 
 
 # =========================
@@ -401,7 +559,6 @@ def gen_image_with_gemini_image(
 
     ensure_dir(str(pathlib.Path(out_path).parent))
 
-    # 일부 SDK/모델은 bytes가 바로 PNG가 아닌 경우가 있어 Pillow로 한 번 로드/저장 시도
     try:
         im = Image.open(BytesIO(img_bytes))
         im.save(out_path)
@@ -413,9 +570,9 @@ def gen_image_with_gemini_image(
 
 
 # =========================
-# Step 4: Shorts video render (FFmpeg only)
+# Step 4: Shorts video render
 #   - 1080x1920 (9:16)
-#   - center crop + slight zoom
+#   - Veo(i2v) preferred (if configured), else ffmpeg zoompan fallback
 # =========================
 
 def write_concat_list(paths: List[str], list_path: str) -> str:
@@ -426,14 +583,40 @@ def write_concat_list(paths: List[str], list_path: str) -> str:
     ensure_dir(str(pathlib.Path(list_path).parent))
     with open(list_path, "w", encoding="utf-8") as f:
         for p in paths:
-            # ffmpeg concat: file 'path'
-            # 작은따옴표는  ' -> '\''
             p2 = p.replace("\\", "/")
             p2 = p2.replace("'", "'\\''")
             f.write("file '" + p2 + "'\n")
     return list_path
 
-def render_scene_video_9x16(
+
+def can_use_veo(cfg: "PipelineConfig") -> bool:
+    if not cfg.use_veo:
+        return False
+    return bool(os.getenv(cfg.veo_api_key_env))
+
+
+def generate_scene_video_with_veo(
+    *,
+    cfg: "PipelineConfig",
+    image_path: str,
+    prompt: str,
+    duration: float,
+    out_path: str,
+    size: Tuple[int, int] = (1080, 1920),
+    fps: int = 30,
+) -> str:
+    """
+    (스텁) Veo 이미지→비디오 생성.
+    - 실제 구현은 Vertex AI / Gemini API 방식에 맞게 교체 필요.
+    """
+    # TODO:
+    # 1) 이미지 bytes 로드
+    # 2) Veo i2v 요청(prompt + image + duration + aspect(9:16) + fps)
+    # 3) 응답 video bytes를 out_path에 저장
+    raise NotImplementedError("Veo 호출 구현이 필요합니다. (환경/SDK에 맞게 채우세요)")
+
+
+def render_scene_video_9x16_ffmpeg(
     image_path: str,
     duration: float,
     out_path: str,
@@ -442,7 +625,7 @@ def render_scene_video_9x16(
     zoom: float = 1.10,
 ) -> str:
     """
-    한 장면 = 한 이미지로 duration초 영상 생성.
+    (폴백) 한 장면 = 한 이미지로 duration초 영상 생성.
     - 이미지 비율 무관하게 9:16으로 center crop
     - duration 동안 약한 줌 인
     """
@@ -471,6 +654,47 @@ def render_scene_video_9x16(
         out_path
     ])
     return out_path
+
+
+def render_scene_video_9x16(
+    *,
+    cfg: "PipelineConfig",
+    image_path: str,
+    duration: float,
+    out_path: str,
+    scene_prompt: str,
+    size: Tuple[int, int] = (1080, 1920),
+    fps: int = 30,
+    zoom: float = 1.10,
+) -> str:
+    """
+    고퀄 우선: Veo(i2v) → 실패/미설정 시 ffmpeg 줌팬 폴백
+    """
+    ensure_dir(str(pathlib.Path(out_path).parent))
+
+    if can_use_veo(cfg):
+        try:
+            return generate_scene_video_with_veo(
+                cfg=cfg,
+                image_path=image_path,
+                prompt=scene_prompt,
+                duration=duration,
+                out_path=out_path,
+                size=size,
+                fps=fps,
+            )
+        except Exception as e:
+            logging.warning(f"Veo failed, fallback to ffmpeg zoompan: {e}")
+
+    return render_scene_video_9x16_ffmpeg(
+        image_path=image_path,
+        duration=duration,
+        out_path=out_path,
+        size=size,
+        fps=fps,
+        zoom=zoom,
+    )
+
 
 def concat_videos(video_paths: List[str], out_path: str) -> str:
     """
@@ -526,12 +750,21 @@ class PipelineConfig:
     # Gemini
     gemini_text_model: str = "gemini-2.5-flash"
     gemini_image_model: str = "gemini-2.5-flash-image-preview"
+
     # Shorts video
     shorts_size: Tuple[int, int] = (1080, 1920)
     fps: int = 30
     min_scene_sec: float = 3.0
     max_scene_sec: float = 7.0
+
+    # Existing test flag (kept)
     use_test_novel_for_gemini: bool = True
+
+    # NEW: Veo preference (i2v)
+    use_veo: bool = True
+    veo_model: str = "veo-3.1"  # placeholder label
+    veo_api_key_env: str = "GOOGLE_API_KEY"  # if you use a different key, change this
+
 
 def load_json(path: str) -> Optional[dict]:
     p = pathlib.Path(path)
@@ -550,9 +783,9 @@ def script_base_dir() -> str:
     try:
         return str(pathlib.Path(__file__).resolve().parent)
     except NameError:
-        # 인터프리터/노트북 등에서 __file__이 없을 수 있음
         return os.getcwd()
-    
+
+
 def run_pipeline_shorts(issue_context: str, cfg: PipelineConfig) -> str:
     base = script_base_dir()
     wd = ensure_dir(os.path.join(base, cfg.workdir))
@@ -571,46 +804,72 @@ def run_pipeline_shorts(issue_context: str, cfg: PipelineConfig) -> str:
     logging.info(f" - final:  {final_dir}")
 
     # -------------------------
-    # 1) NOVEL (OpenAI) with cache
+    # NEW: URL input -> news mode
     # -------------------------
-    novel_json_path = os.path.join(texts_dir, "novel.json")
-    novel_txt_path  = os.path.join(texts_dir, "novel.txt")
+    news_mode = False
+    article_title = ""
+    article_body = ""
 
-    novel_pack = load_json(novel_json_path)
-    if cfg.use_test_novel_for_gemini:
-        logging.info("TEST MODE: GPT 생략, 임시 텍스트로 Gemini 테스트")
-        novel = TEST_NOVEL_TEXT
-        save_text(os.path.join(texts_dir, "novel_test.txt"), novel)
-    else:
+    if is_url(issue_context):
+        news_mode = True
+        logging.info(f"[INPUT] URL detected -> news mode: {issue_context}")
+        article_title, article_body = fetch_article_text(issue_context)
+        logging.info(f"[NEWS] title={article_title} body_len={len(article_body)}")
+
+    # -------------------------
+    # 1) NOVEL (OpenAI) with cache
+    #    - skipped in news_mode
+    # -------------------------
+    novel = ""
+    if not news_mode:
         novel_json_path = os.path.join(texts_dir, "novel.json")
         novel_txt_path  = os.path.join(texts_dir, "novel.txt")
 
         novel_pack = load_json(novel_json_path)
-        if novel_pack and isinstance(novel_pack, dict) and novel_pack.get("novel"):
-            logging.info("CACHE HIT: texts/novel.json -> OpenAI 호출 생략")
+        if cfg.use_test_novel_for_gemini:
+            logging.info("TEST MODE: GPT 생략, 임시 텍스트로 Gemini 테스트")
+            novel = TEST_NOVEL_TEXT
+            save_text(os.path.join(texts_dir, "novel_test.txt"), novel)
         else:
-            logging.info("CACHE MISS: texts/novel.json 없음/깨짐 -> OpenAI로 소설 생성")
-            novel_pack = gpt_make_novel(issue_context, model=cfg.gpt_model)
-            save_text(novel_json_path, json.dumps(novel_pack, ensure_ascii=False, indent=2))
-            save_text(novel_txt_path, novel_pack.get("novel", ""))
+            novel_pack = load_json(novel_json_path)
+            if novel_pack and isinstance(novel_pack, dict) and novel_pack.get("novel"):
+                logging.info("CACHE HIT: texts/novel.json -> OpenAI 호출 생략")
+            else:
+                logging.info("CACHE MISS: texts/novel.json 없음/깨짐 -> OpenAI로 소설 생성")
+                novel_pack = gpt_make_novel(issue_context, model=cfg.gpt_model)
+                save_text(novel_json_path, json.dumps(novel_pack, ensure_ascii=False, indent=2))
+                save_text(novel_txt_path, novel_pack.get("novel", ""))
 
-        novel = (novel_pack or {}).get("novel", "")
-    if not novel.strip():
-        raise RuntimeError("novel이 비어있습니다. texts/novel.json을 확인하세요.")
+            novel = (novel_pack or {}).get("novel", "")
+
+        if not novel.strip():
+            raise RuntimeError("novel이 비어있습니다. texts/novel.json을 확인하세요.")
 
     # -------------------------
     # 2) SCRIPT (Gemini) with cache
+    #    - in news_mode: article -> ScriptPack
     # -------------------------
     script_json_path = os.path.join(texts_dir, "script.json")
 
     script_data = load_json(script_json_path)
     if script_data:
-        logging.info("CACHE HIT: texts/script.json -> Gemini scriptify 호출 생략")
+        logging.info("CACHE HIT: texts/script.json -> Gemini 호출 생략")
         script = ScriptPack.model_validate(script_data)
     else:
         logging.info("CACHE MISS: texts/script.json 없음 -> Gemini로 스크립트 생성")
         gen_client = make_genai_client_dev()
-        script = gemini_scriptify(novel, client=gen_client, model=cfg.gemini_text_model)
+
+        if news_mode:
+            script = gemini_news_scriptify(
+                article_title=article_title,
+                article_body=article_body,
+                client=gen_client,
+                model=cfg.gemini_text_model,
+                max_scenes=7,
+            )
+        else:
+            script = gemini_scriptify(novel, client=gen_client, model=cfg.gemini_text_model)
+
         save_text(script_json_path, script.model_dump_json(indent=2, ensure_ascii=False))
 
     if not script.scenes:
@@ -654,13 +913,12 @@ def run_pipeline_shorts(issue_context: str, cfg: PipelineConfig) -> str:
 
         img_paths.append(out_img)
 
-    # 이미지 파일이 실제로 만들어졌는지 안전 체크
     for p in img_paths:
         if not (os.path.exists(p) and os.path.getsize(p) > 0):
             raise RuntimeError(f"이미지 생성 실패 또는 파일 없음: {p}")
 
     # -------------------------
-    # 4) SCENE RENDER (ffmpeg) with cache
+    # 4) SCENE RENDER (Veo preferred, fallback ffmpeg) with cache
     # -------------------------
     scene_videos: List[str] = []
     for sc, imgp, dur in zip(script.scenes, img_paths, durations):
@@ -670,11 +928,22 @@ def run_pipeline_shorts(issue_context: str, cfg: PipelineConfig) -> str:
             logging.info(f"CACHE HIT: 장면 영상 존재 -> {out_clip}")
         else:
             logging.info(f"RENDER: 장면 영상 생성 -> {out_clip}")
+            # Veo에 줄 프롬프트는 "visual + narration + image_prompt"를 합쳐 좀 더 안정적으로
+            scene_prompt = (
+                f"[SCENE TITLE] {sc.title}\n"
+                f"[VISUAL] {sc.visual}\n"
+                f"[NARRATION] {sc.narration}\n"
+                f"[IMAGE PROMPT] {sc.image_prompt}\n"
+                f"[STYLE] vertical 9:16, cinematic, documentary/news tone, no on-screen text"
+            )
+
             render_scene_video_9x16(
+                cfg=cfg,
                 image_path=imgp,
                 duration=dur,
                 out_path=out_clip,
-                size=cfg.shorts_size,   # 1080x1920
+                scene_prompt=scene_prompt,
+                size=cfg.shorts_size,
                 fps=cfg.fps,
                 zoom=1.10,
             )
@@ -705,6 +974,7 @@ def run_pipeline_shorts(issue_context: str, cfg: PipelineConfig) -> str:
     logging.info(f"[DONE] FINAL VIDEO = {final_path}")
     return final_path
 
+
 TEST_NOVEL_TEXT = """
 서울의 겨울 밤, 지하철 막차를 놓친 민수는 편의점 앞에서 우연히 고등학교 동창 지연을 만난다.
 두 사람은 각자 다른 삶을 살고 있었고, 짧은 대화 속에서 서로의 실패와 후회를 조심스럽게 꺼낸다.
@@ -713,9 +983,18 @@ TEST_NOVEL_TEXT = """
 그날 밤 이후 민수는 작은 선택 하나를 바꾸기로 결심한다.
 """.strip()
 
+
 if __name__ == "__main__":
     cfg = PipelineConfig(
-        use_test_novel_for_gemini=True  # ✅ 여기서 제어
+        use_test_novel_for_gemini=True,  # ✅ 뉴스 URL을 넣으면 이 플래그와 무관하게 news_mode로 동작
+        use_veo=True,                    # ✅ 키+구현이 있으면 Veo 우선, 아니면 자동 폴백
     )
-    out = run_pipeline_shorts("TEST ISSUE (unused)", cfg)
+
+    # ✅ 예시 1) 뉴스 링크로 실행
+    out = run_pipeline_shorts("https://n.news.naver.com/article/008/0005295323?cds=news_media_pc&type=editn", cfg)
     print(out)
+
+    # ✅ 예시 2) 기존 텍스트(소설 파이프라인)로 실행하고 싶으면 아래처럼:
+    # cfg.use_test_novel_for_gemini = False
+    # out2 = run_pipeline_shorts("어떤 사회 이슈 텍스트", cfg)
+    # print(out2)
